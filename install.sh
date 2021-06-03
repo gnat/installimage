@@ -190,6 +190,7 @@ wait_for_udev
 if [ "$SWRAID" = "1" ]; then
   inc_step
   status_busy "Creating software RAID level $SWRAIDLEVEL"
+  set_raid0_default_layout
   make_swraid "$FOLD/fstab"
   suspend_swraid_resync
   status_donefailed $?
@@ -578,11 +579,9 @@ if [ -n "$OPT_SSHKEYS_URL" ] ; then
 fi
 
 #
-# Report install.conf to rz-admin
-# Report debug.txt to rz-admin
+# Report install.conf and debug.txt to $STATSSERVER
 #
-report_id="$(report_config)"
-report_debuglog $report_id
+report_install
 
 #
 # Save installimage configuration and debug file on the new system

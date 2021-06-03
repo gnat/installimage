@@ -729,6 +729,9 @@ if [ -n "$1" ]; then
           PART_SIZE[$i]=$((${PART_SIZE[$i]}/(COUNT_DRIVES/2)))
         fi
       fi
+      if [[ "${PART_MOUNT["$i"]}" == swap ]] && ((SWRAIDLEVEL == 0)); then
+        PART_SIZE["$i"]="$((${PART_SIZE["$i"]}/COUNT_DRIVES))"
+      fi
     fi
     echo "${PART_MOUNT[$i]} : ${PART_SIZE[$i]}" | debugoutput
     if [ "${PART_SIZE[$i]}" != "all" ]; then
@@ -1707,14 +1710,15 @@ unmount_all() {
 # Stop the Logical Volume Manager and all software RAID arrays.
 #
 stop_lvm_raid() {
-  test -x /etc/init.d/lvm && /etc/init.d/lvm stop &>/dev/null
-  test -x /etc/init.d/lvm2 && /etc/init.d/lvm2 stop &>/dev/null
+  [ -x "$(command -v vgchange)" ] && vgchange -an >> /dev/null 2>&1
 
-  dmsetup remove_all > /dev/null 2>&1
+  [ -x "$(command -v dmsetup)" ] && dmsetup remove_all > /dev/null 2>&1
 
-  test -x "$(which mdadm)" && for i in $(cat /proc/mdstat | grep md | cut -d ' ' -f1); do
-    [ -e /dev/$i ] && mdadm -S /dev/$i >> /dev/null 2>&1
-  done
+  if [ -x "$(command -v mdadm)" ] && [ -f /proc/mdstat ]; then
+    while read -r i; do
+      [ -e "/dev/$i" ] && mdadm -S "/dev/$i" >> /dev/null 2>&1
+    done < <(grep md /proc/mdstat | cut -d ' ' -f1)
+  fi
 }
 
 
@@ -2382,7 +2386,7 @@ format_partitions() {
       if [ "$FS" = "swap" ]; then
         # format swap partition with dd first because mkswap
         # doesnt overwrite sw-raid information!
-        mkfs -t xfs -f $DEV &> /dev/null
+        mkfs -t xfs -K -f $DEV &> /dev/null
         dd if=/dev/zero of=$DEV bs=256 count=8 &> /dev/null
         # then write swap information
         mkswap $DEV 2>&1 | debugoutput ; EXITCODE=$?
@@ -2391,6 +2395,8 @@ format_partitions() {
           if ((IMG_VERSION < 70)) || ((IMG_VERSION == 610)); then
             mkfs -O ^64bit,^metadata_csum -t $FS -q $DEV 2>&1 | debugoutput ; EXITCODE=$?
             ((EXITCODE == 0)) || mkfs -t $FS -q $DEV 2>&1 | debugoutput ; EXITCODE=$?
+          elif ((IMG_VERSION > 70)) && ((IMG_VERSION < 80)); then
+            mkfs -O ^metadata_csum -t $FS -q $DEV 2>&1 | debugoutput ; EXITCODE=$?
           else
             mkfs -t $FS -q $DEV 2>&1 | debugoutput ; EXITCODE=$?
           fi
@@ -2400,9 +2406,13 @@ format_partitions() {
       elif [ "$FS" = "btrfs" ] || [ "$FS" = "vfat" ]; then
         mkfs -t $FS $DEV 2>&1 | debugoutput ; EXITCODE=$?
       elif [[ "$FS" == 'xfs' ]] && ((xfs_force_v4 == 1)); then
-        mkfs -t $FS -q -f $DEV -m crc=0,finobt=0 2>&1 >/dev/null | debugoutput ; EXITCODE=$?
+        mkfs -t $FS -q -K -f $DEV -m crc=0,finobt=0 2>&1 >/dev/null | debugoutput ; EXITCODE=$?
       else
-        mkfs -t $FS -q -f $DEV 2>&1 >/dev/null | debugoutput ; EXITCODE=$?
+        if [[ "$FS" == 'xfs' ]]; then
+          mkfs -t $FS -q -K -f $DEV 2>&1 >/dev/null | debugoutput ; EXITCODE=$?
+        else
+          mkfs -t $FS -q -f $DEV 2>&1 >/dev/null | debugoutput ; EXITCODE=$?
+        fi
       fi
     else
       debug "! this is no valid block device:  $DEV"
@@ -3221,12 +3231,15 @@ generate_new_sshkeys() {
           if ! execute_chroot_command "ssh-keygen -l -f ${file} -E md5 > /tmp/${key_type} 2> /dev/null"; then
             execute_chroot_command "ssh-keygen -l -f ${file} > /tmp/${key_type}"
           fi
+          execute_chroot_command "ssh-keygen -l -f ${file} -E sha256 > /tmp/${key_type}.sha256 2> /dev/null"
           while read bits fingerprint name type ; do
             fingerprint="$(echo "${fingerprint}" | sed "s/^MD5://")"
+            sha256_fingerprint="$(awk '{ print $2 }' "$FOLD/hdd/tmp/${key_type}.sha256" | cut -d : -f 2)"
             key_json="${key_json}, \"key_bits\": \"${bits}\", \"key_fingerprint\": \"${fingerprint}\", \"key_name\": \"${name}\""
+            [[ -n "$sha256_fingerprint" ]] && key_json+=", \"sha256_fingerprint\": \"$sha256_fingerprint\""
           done <<< $(cat "$FOLD/hdd/tmp/${key_type}")
           [ -z "${keys_json}" ] && keys_json="{${key_json}}" || keys_json="${keys_json}, {${key_json}}"
-          rm "$FOLD/hdd/tmp/${key_type}"
+          rm "$FOLD/hdd/tmp/${key_type}" "$FOLD/hdd/tmp/${key_type}.sha256"
         fi
     done
     keys_json="{\"keys\": [ ${keys_json} ] }"
@@ -3516,15 +3529,55 @@ copy_ssh_keys() {
 set_ssh_rootlogin() {
   if [ "$1" ]; then
      local permit="$1"
+     local mod_count=0
      case $permit in
        yes|no|without-password|forced-commands-only)
-         sed -i "$FOLD/hdd/etc/ssh/sshd_config" -e "s/^\(#\)\?PermitRootLogin.*/PermitRootLogin $1/"
+         while IFS= read -r line; do
+           # line must include PermitRootLogin
+           if ! echo "$line" | grep -q 'PermitRootLogin'; then
+             echo "$line" >> "$FOLD/sshd_config"
+             continue
+           fi
+
+           # line must not be indented
+           local indentation
+           if echo "$line" | grep -q '#'; then
+             indentation="$(echo "$line" | cut -d '#' -f 1 | tr -d "\n" | wc -m)"
+           else
+             indentation="$(echo "$line" | cut -d 'P' -f 1 | tr -d "\n" | wc -m)"
+           fi
+           if ((indentation != 0)); then
+             echo "$line" >> "$FOLD/sshd_config"
+             continue
+           fi
+
+           # line must not be a comment
+           local word_count
+           word_count="$(echo "$line" | cut -d '#' -f 2- | wc -w)"
+           if ((word_count != 2)); then
+             echo "$line" >> "$FOLD/sshd_config"
+             continue
+           fi
+
+           echo "PermitRootLogin $1" >> "$FOLD/sshd_config"
+         done < "$FOLD/hdd/etc/ssh/sshd_config"
+
+         debug '# set SSH PermitRootLogin'
+         diff -Naur "$FOLD/hdd/etc/ssh/sshd_config" "$FOLD/sshd_config" | debugoutput
+
+         cp "$FOLD/sshd_config" "$FOLD/hdd/etc/ssh/sshd_config"
        ;;
        *)
          debug "invalid option for PermitRootLogin"
          return 1
        ;;
      esac
+     # fail on multiple entries
+     if ((mod_count > 1)); then
+       debug "sshd_config: PermitRootLogin specified more than once"
+       # only abort on nfs image install
+       [[ "$(readlink -f "$IMAGE_PATH")" == '/root/.oldroot/nfs/images' ]] && return 1
+     fi
   else
      return 1
   fi
@@ -3792,34 +3845,6 @@ install_robot_report_script() {
   return 1
 }
 
-report_config() {
-  local config_file="$FOLD/install.conf"
-  # use rz-admin IP (not DNS, might break) to report the install.conf
-  local report_ip="$STATSSERVER"
-  local report_status=""
-
-  report_status="$(curl -m 10 -s -k -X POST --data-urlencode "config@$config_file" --data-urlencode "mac=$HWADDR" "https://${report_ip}/api/v1/installimage/installations")"
-  echo "report install.conf to rz-admin: ${report_status}" | debugoutput
-
-  echo "${report_status}"
-}
-
-report_debuglog() {
-  local log_id="$1"
-  if [ -z "$log_id" ] ; then
-    echo "report_debuglog: no log_id given" | debugoutput
-    return 1
-  fi
-  # use rz-admin IP (not DNS, might break) to report the install.conf
-  local report_ip="$STATSSERVER"
-  local report_status=""
-
-  report_status="$(curl -m 10 -s -k -X POST -T "$DEBUGFILE" -H 'Content-Type: text/plain' "https://${report_ip}/api/v1/installimage/installations/${log_id}/logs")"
-  echo "report debug.txt to rz-admin: ${report_status}" | debugoutput
-
-  return 0
-}
-
 #
 # cleanup
 #
@@ -3827,6 +3852,7 @@ report_debuglog() {
 #
 cleanup() {
   debug 'cleaning up'
+  unset_raid0_default_layout
   mysql_running && stop_mysql
   systemd_nspawn_booted && poweroff_systemd_nspawn
   while read entry; do
@@ -3859,8 +3885,7 @@ exit_function() {
   echo "  https://robot.your-server.de"
   echo
 
-  report_id="$(report_config)"
-  report_debuglog "$report_id"
+  report_install
 }
 
 #function to check if it is a intel or amd cpu
@@ -3931,7 +3956,8 @@ function getHDDsNotInToleranceRange() {
 uuid_bugfix() {
     debug "# change all device names to uuid (e.g. for ide/pata transition)"
     TEMPFILE="$(mktemp)"
-    sed -n 's|^/dev/\(x?[hvs]d[a-z][1-9][0-9]\?\).*|\1|p' < "$FOLD/hdd/etc/fstab" > "$TEMPFILE"
+    sed -n 's|^/dev/\([hvs]d[a-z][1-9][0-9]\?\).*|\1|p' < "$FOLD/hdd/etc/fstab" > "$TEMPFILE"
+    sed -n 's|^/dev/\(x[hvs]d[a-z][1-9][0-9]\?\).*|\1|p' < "$FOLD/hdd/etc/fstab" >> "$TEMPFILE"
     sed -n 's|^/dev/\(nvme[0-9]*n[p0-9]*\?\).*|\1|p' < "$FOLD/hdd/etc/fstab" >> "$TEMPFILE"
     # Also use UUID for md devices to prevent update-initramfs warnings
     sed -n 's|^/dev/\(md\/[0-9]\+\).*|\1|p' < "$FOLD/hdd/etc/fstab" >> "$TEMPFILE"
