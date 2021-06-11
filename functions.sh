@@ -4380,40 +4380,6 @@ install_crypt_dropbear() {
 }
 
 debian_install_crypt_dropbear() {
-  # Hetzner Cloud fix for network routes.
-  cat << EOF > "$FOLD/hdd/etc/initramfs-tools/scripts/init-premount/zz-hetzner-cloud-fix-routes"
-#!/bin/sh
-# Hetzner fix DHCP script
-# Fixes network routes for initramfs in Hetzner Cloud.
-PREREQ="dropbear"
-prereqs()
-{
-  echo "$PREREQ"
-}
-case $1 in
-prereqs)
-  prereqs
-  exit 0
-  ;;
-esac
-. /scripts/functions
-log_begin_msg "Fixing network configuration"
-configure_networking
-# Loop through all network configs.
-for conf in /run/net-${DEVICE}.conf /run/net-*.conf; do
-  if [ -e "${conf}" ]; then
-    # source specific bootdevice
-    . ${conf}
-    ip route add ${IPV4GATEWAY}/${IPV4NETMASK} dev ${DEVICE}
-    ip route add default via ${IPV4GATEWAY} dev ${DEVICE}
-    break
-  fi
-done
-log_end_msg
-exit 0
-EOF
-  # Make executable Hetzner Cloud fix for network routes.
-  chmod +x "$FOLD/hdd/etc/initramfs-tools/scripts/init-premount/zz-hetzner-cloud-fix-routes" || return 1
   # Install ssh keys for dropbear.
   mkdir -p "$FOLD/hdd/etc/dropbear-initramfs/" || return 1
   # Add your authorized_keys to dropbear.
