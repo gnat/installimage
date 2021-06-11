@@ -52,6 +52,8 @@ installimage -c /root/autosetup -f yes -a
 ```
 
 #### After reboot
-SSH in and use `cryptroot-unlock` to unlock your disk.
+SSH in and use one of the following to unlock your disk.
+* `echo -ne "password"> /lib/cryptsetup/passfifo`
+* `cryptroot-unlock`
 
 This contribution is public domain.
